@@ -1,0 +1,23 @@
+docker_image: "debforge-builder:latest"
+docker_dockerfile: "./docker/Dockerfile.builder"
+work_dir: "./.debforge-work"
+output_dir: "./artifacts"
+target_architecture: "native"
+
+source_suite: "bookworm"
+source_repositories:
+  - mirror: "http://deb.debian.org/debian"
+    signed_by: "/usr/share/keyrings/debian-archive-keyring.gpg"
+    suites: ["bookworm", "bookworm-updates"]
+    components: ["main", "contrib", "non-free", "non-free-firmware"]
+  - mirror: "http://security.debian.org/debian-security"
+    signed_by: "/usr/share/keyrings/debian-archive-keyring.gpg"
+    suites: ["bookworm-security"]
+    components: ["main", "contrib", "non-free", "non-free-firmware"]
+
+build_options: "nocheck"
+signing_mode: "debsigs"
+gpg_key_id: ""
+gpg_private_key_secret: "/run/secrets/debforge-gpg-private-key"
+gpg_passphrase_secret: "/run/secrets/debforge-gpg-passphrase"
+keep_build_artifacts: false

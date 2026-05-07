@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debforge"
+version = "0.1.0"
+description = "Build Debian packages from source with signing and publishing"
+requires-python = ">=3.11"
+dependencies = [
+    "pyyaml>=6.0",
+    "docker>=7.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["debforge*"]
+
+[project.scripts]
+debforge = "debforge.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+    "pytest-subprocess>=1.5",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
