@@ -1,48 +1,69 @@
-import os
+from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
-from debforge.exceptions import BuildError
-from debforge.steps.build import _build_command, _collect_deb_artifacts
-
-
-def test_collect_deb_artifacts_success(tmp_path):
-    deb = tmp_path / "hello_1.0_amd64.deb"
-    deb.write_bytes(b"")
-    result = _collect_deb_artifacts(str(tmp_path))
-    assert str(deb) in result
+from debforge.package_list import PackageSpec
+from debforge.steps.build import build_source, prepare_build_environment
+from debforge.steps.download import AptSandbox, SourceSpec
 
 
-def test_collect_deb_artifacts_empty(tmp_path):
-    with pytest.raises(BuildError, match="No .deb files"):
-        _collect_deb_artifacts(str(tmp_path))
+def test_prepare_cross_build_environment_runs_inside_current_process(mocker):
+    sandbox = AptSandbox({}, {"APT_CONFIG": "/work/build.conf"}, Path("/tmp/auth"))
+    capture = mocker.patch("debforge.steps.build.capture_command", return_value="amd64\n")
+    run = mocker.patch("debforge.steps.build.run_command")
+
+    native = prepare_build_environment("arm64", sandbox)
+
+    assert native == "amd64"
+    capture.assert_called_once()
+    assert mocker.call(["dpkg", "--add-architecture", "arm64"], env=sandbox.build_env) in run.mock_calls
+    assert any("crossbuild-essential-arm64" in call.args[0] for call in run.mock_calls)
 
 
-def test_build_command_structure():
-    cmd = _build_command("/work/hello-1.0")
-    assert "/bin/bash" in cmd
-    assert "-c" in cmd
-    script = cmd[-1]
-    assert "hello-1.0" in script
-    assert "dpkg-buildpackage" in script
-    assert "-us" in script
-    assert "-uc" in script
-    assert "apt-get build-dep" in script
+def test_build_source_calls_dpkg_buildpackage_directly(tmp_path, mocker):
+    sandbox = AptSandbox({}, {"APT_CONFIG": "/work/build.conf"}, tmp_path / "auth")
+    unpacked = tmp_path / "source"
+    unpacked.mkdir()
+    mocker.patch("debforge.steps.build.fetch_source", return_value=unpacked)
+    run = mocker.patch("debforge.steps.build.run_command")
+    mocker.patch("debforge.steps.build.Path.glob", return_value=[])
 
-
-def test_build_in_docker_raises_on_failure(pkg_ctx, mocker):
-    mocker.patch("debforge.steps.build.docker_client.ensure_image")
-
-    # Fake source dir — also set dsc_path so _find_source_dir finds it
-    source_dir = os.path.join(pkg_ctx.work_dir, "hello-1.0")
-    os.makedirs(source_dir)
-    pkg_ctx.dsc_path = os.path.join(pkg_ctx.work_dir, "hello_1.0.dsc")
-
-    mocker.patch(
-        "debforge.steps.build.docker_client.run_build_container",
-        return_value=(1, "Build error output"),
+    result = build_source(
+        SourceSpec("hello", "2.10-3"),
+        [PackageSpec("hello", "2.10-3")],
+        tmp_path,
+        "amd64",
+        "amd64",
+        sandbox,
+        "nocheck",
     )
 
-    from debforge.steps.build import build_in_docker
-    with pytest.raises(BuildError, match="dpkg-buildpackage failed"):
-        build_in_docker(pkg_ctx)
+    assert result == {}
+    commands = [call.args[0] for call in run.mock_calls]
+    assert any(command[0:2] == ["apt-get", "build-dep"] for command in commands)
+    assert ["dpkg-buildpackage", "--no-sign", "--build=binary"] in commands
+
+
+def test_build_source_recreates_exact_bin_nmu_version(tmp_path, mocker):
+    sandbox = AptSandbox({}, {}, tmp_path / "auth")
+    unpacked = tmp_path / "downloaded"
+    unpacked.mkdir()
+    mocker.patch("debforge.steps.build.fetch_source", return_value=unpacked)
+    run = mocker.patch("debforge.steps.build.run_command")
+    mocker.patch("debforge.steps.build.Path.glob", return_value=[])
+
+    build_source(
+        SourceSpec("foo", "1.0-1"),
+        [PackageSpec("libfoo", "1.0-1+b1")],
+        tmp_path,
+        "amd64",
+        "amd64",
+        sandbox,
+        "nocheck",
+    )
+
+    commands = [call.args[0] for call in run.mock_calls]
+    assert any(
+        command[0] == "dch" and command[command.index("--newversion") + 1] == "1.0-1+b1"
+        for command in commands
+    )

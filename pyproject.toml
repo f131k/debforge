@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "debforge"
 version = "0.1.0"
-description = "Build Debian packages from source with signing and publishing"
+description = "Build and sign Debian packages from source in one container"
 requires-python = ">=3.11"
 dependencies = [
     "pyyaml>=6.0",
-    "docker>=7.0",
 ]
 
 [tool.setuptools.packages.find]

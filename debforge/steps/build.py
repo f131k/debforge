@@ -1,74 +1,150 @@
 from __future__ import annotations
 
-import glob
 import logging
 import os
+import re
+import shutil
+import subprocess
+from collections import defaultdict
+from pathlib import Path
 
-from .. import docker_client
-from ..exceptions import BuildError
-from ..network import container_proxy_environment
+from ..exceptions import BuildError, DownloadError
+from ..package_list import PackageSpec
+from .download import AptSandbox, SourceSpec, capture_command, fetch_source, run_command
 
 logger = logging.getLogger(__name__)
 
 
-def build_in_docker(ctx) -> None:
-    logger.info("[%s] Building package in Docker container", ctx.name)
+def prepare_build_environment(architecture: str, sandbox: AptSandbox) -> str:
+    """Prepare the running container for native or cross compilation."""
+    native_arch = capture_command(
+        ["dpkg", "--print-architecture"], env=sandbox.build_env
+    ).strip()
+    if architecture != native_arch:
+        run_command(["dpkg", "--add-architecture", architecture], env=sandbox.build_env)
+        run_command(["apt-get", "update"], env=sandbox.build_env)
+        run_command(
+            [
+                "apt-get",
+                "install",
+                "-y",
+                "--no-install-recommends",
+                f"crossbuild-essential-{architecture}",
+            ],
+            env=sandbox.build_env,
+        )
+    return native_arch
 
-    docker_client.ensure_image(ctx.config.docker_image, ctx.config.docker_dockerfile)
 
-    source_dir = _find_source_dir(ctx)
-    artifacts_dir = ctx.work_dir  # dpkg-buildpackage places .deb one level up from source tree
+def build_source(
+    source: SourceSpec,
+    requested: list[PackageSpec],
+    root: Path,
+    architecture: str,
+    native_architecture: str,
+    sandbox: AptSandbox,
+    build_options: str,
+) -> dict[str, list[Path]]:
+    """Download and build one source package directly in the current container."""
+    safe_name = re.sub(r"[^a-zA-Z0-9_.+-]", "_", source.display)
+    source_root = root / "sources" / safe_name
+    try:
+        unpacked = fetch_source(source, source_root / "download", sandbox)
+        run_command(
+            [
+                "apt-get",
+                "build-dep",
+                "-y",
+                "--no-install-recommends",
+                f"--host-architecture={architecture}",
+                source.display,
+            ],
+            cwd=unpacked,
+            env=sandbox.build_env,
+        )
+    except DownloadError as exc:
+        raise BuildError(f"{source.display}: {exc}") from exc
 
-    # Build runs with root inside container so apt-get build-dep works.
-    # dpkg-buildpackage -us -uc: skip signing (done on host after container exit).
-    # -b: binary-only build (no source package output).
-    cmd = _build_command(source_dir)
+    found: dict[str, list[Path]] = defaultdict(list)
+    output_dir = root / "unsigned"
+    output_dir.mkdir(exist_ok=True)
+    packages_by_version: dict[str, list[PackageSpec]] = defaultdict(list)
+    for package in requested:
+        packages_by_version[package.version].append(package)
 
-    exit_code, logs = docker_client.run_build_container(
-        image=ctx.config.docker_image,
-        source_dir=artifacts_dir,
-        command=cmd,
-        env={
-            "DEBIAN_FRONTEND": "noninteractive",
-            "DEB_BUILD_OPTIONS": "nocheck",
-            **container_proxy_environment(),
-        },
+    for binary_version, version_packages in packages_by_version.items():
+        variant_parent = source_root / "builds" / _safe_component(binary_version)
+        variant_source = variant_parent / unpacked.name
+        variant_parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(unpacked, variant_source, symlinks=True)
+        package_env = dict(
+            sandbox.build_env,
+            DEB_BUILD_OPTIONS=build_options,
+            DEBFULLNAME="debforge",
+            DEBEMAIL="debforge@localhost",
+        )
+        try:
+            if binary_version != source.version:
+                _set_binary_version(variant_source, binary_version, package_env)
+            command = ["dpkg-buildpackage", "--no-sign", "--build=binary"]
+            if architecture != native_architecture:
+                command.append(f"--host-arch={architecture}")
+            run_command(command, cwd=variant_source, env=package_env)
+        except DownloadError as exc:
+            raise BuildError(f"{source.display} as binary version {binary_version}: {exc}") from exc
+
+        wanted = {
+            (package.name.split(":", 1)[0], package.version): package
+            for package in version_packages
+        }
+        for artifact in variant_parent.glob("*.deb"):
+            binary_name, version, artifact_arch = _deb_fields(artifact)
+            matched_package = wanted.get((binary_name, version))
+            if matched_package and artifact_arch in {architecture, "all"}:
+                destination = output_dir / artifact.name
+                shutil.copy2(artifact, destination)
+                found[matched_package.name].append(destination)
+    return dict(found)
+
+
+def _set_binary_version(source_dir: Path, version: str, env: dict[str, str]) -> None:
+    """Create a local changelog entry for an exact binNMU/vendor binary version."""
+    run_command(
+        [
+            "dch",
+            "--no-conf",
+            "--newversion",
+            version,
+            "--distribution",
+            "UNRELEASED",
+            "--force-distribution",
+            "Rebuild exact installed binary version.",
+        ],
+        cwd=source_dir,
+        env=env,
     )
 
-    if exit_code != 0:
-        raise BuildError(
-            f"[{ctx.name}] dpkg-buildpackage failed (exit {exit_code}).\n"
-            f"Last log lines:\n" + "\n".join(logs.splitlines()[-30:])
-        )
 
-    ctx.deb_paths = _collect_deb_artifacts(artifacts_dir)
-    logger.info("[%s] Build successful: %s", ctx.name, ctx.deb_paths)
+def _safe_component(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.+-]", "_", value)
 
 
-def _find_source_dir(ctx) -> str:
-    if ctx.dsc_path:
-        # Source dir is typically unpacked alongside the .dsc by dpkg-source
-        candidates = [
-            d for d in os.listdir(ctx.work_dir)
-            if os.path.isdir(os.path.join(ctx.work_dir, d))
-        ]
-        if candidates:
-            return os.path.join(ctx.work_dir, candidates[0])
-    raise BuildError(f"[{ctx.name}] Cannot locate unpacked source directory in {ctx.work_dir!r}")
-
-
-def _collect_deb_artifacts(directory: str) -> list[str]:
-    debs = glob.glob(os.path.join(directory, "*.deb"))
-    if not debs:
-        raise BuildError(f"No .deb files found in {directory!r} after build")
-    return debs
-
-
-def _build_command(source_package_dir: str) -> list[str]:
-    # /build/<source_dir> is the path inside the container (work_dir is mounted at /build)
-    source_basename = os.path.basename(source_package_dir)
-    inner_path = f"/build/{source_basename}"
-    return [
-        "/bin/bash", "-c",
-        f"cd {inner_path} && apt-get build-dep -y . && dpkg-buildpackage -us -uc -b",
-    ]
+def _deb_fields(path: Path) -> tuple[str, str, str]:
+    process = subprocess.run(
+        [
+            "dpkg-deb",
+            "--show",
+            "--showformat=${Package}\t${Version}\t${Architecture}\n",
+            str(path),
+        ],
+        env=dict(os.environ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        raise BuildError(process.stderr.strip() or f"cannot inspect {path.name}")
+    values = process.stdout.rstrip("\n").split("\t")
+    if len(values) != 3:
+        raise BuildError(f"unexpected dpkg-deb metadata for {path.name}")
+    return values[0], values[1], values[2]

@@ -16,11 +16,3 @@ class BuildError(DebforgeError):
 
 class SigningError(DebforgeError):
     pass
-
-
-class PublishError(DebforgeError):
-    pass
-
-
-class DockerError(DebforgeError):
-    pass

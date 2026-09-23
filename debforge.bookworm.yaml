@@ -1,7 +1,5 @@
-docker_image: "debforge-builder:latest"
-docker_dockerfile: "./docker/Dockerfile.builder"
-work_dir: "./.debforge-work"
-output_dir: "./artifacts"
+work_dir: "/work"
+output_dir: "/output"
 target_architecture: "native"
 
 source_suite: "bookworm"

@@ -1,89 +1,142 @@
 from __future__ import annotations
 
+import json
 import logging
-import os
 import shutil
-from dataclasses import dataclass, field
+import tempfile
+from collections import defaultdict
+from pathlib import Path
 
 from .config import DebforgeConfig
-from .exceptions import DebforgeError
-from .steps import build, download, publish, security_scan, sign_binaries, sign_package
+from .exceptions import BuildError, DownloadError
+from .network import load_network_config
+from .package_list import PackageSpec
+from .steps import build, download, sign_package
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class PackageContext:
-    name: str
-    work_dir: str
-    config: DebforgeConfig
-    dsc_path: str | None = None
-    deb_paths: list[str] = field(default_factory=list)
+def rebuild_packages(
+    packages: list[PackageSpec],
+    config: DebforgeConfig,
+) -> dict[str, object]:
+    """Run the complete rebuild pipeline in the current (builder) container."""
+    sign_package.validate_signing_secrets(
+        config.gpg_private_key_secret,
+        config.gpg_passphrase_secret,
+    )
+    work_root = Path(config.work_dir)
+    work_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=work_root))
+    sandbox: download.AptSandbox | None = None
 
-
-def run_packages(packages: list[str], config: DebforgeConfig) -> dict[str, bool]:
-    results: dict[str, bool] = {}
-    for package in packages:
-        logger.info("=== Processing package: %s ===", package)
-        try:
-            run_single_package(package, config)
-            results[package] = True
-        except DebforgeError as e:
-            logger.error("[%s] Pipeline failed: %s", package, e)
-            results[package] = False
-        except Exception:
-            logger.exception("[%s] Unexpected error", package)
-            results[package] = False
-
-    _print_summary(results)
-    return results
-
-
-def run_single_package(package: str, config: DebforgeConfig) -> None:
-    pkg_work_dir = os.path.join(config.work_dir, package)
-    os.makedirs(pkg_work_dir, exist_ok=True)
-
-    ctx = PackageContext(name=package, work_dir=pkg_work_dir, config=config)
+    architecture = (
+        download.resolve_native_architecture()
+        if config.target_architecture == "native"
+        else config.target_architecture
+    )
+    entries: dict[PackageSpec, dict[str, object]] = {
+        package: {
+            "name": package.name,
+            "version": package.version,
+            "success": False,
+            "source": None,
+            "artifacts": [],
+        }
+        for package in packages
+    }
+    signing: dict[str, object] = {"mode": "debsigs", "signed": False, "artifacts": []}
 
     try:
-        download.fetch_source(ctx)
-        security_scan.scan(ctx)
-        build.build_in_docker(ctx)
-        _run_step_stub(ctx, sign_binaries.sign, "binary signing")
-        sign_package.sign_deb(ctx)
-        publish.add_to_repo(ctx)
+        sandbox = download.setup_apt_sandbox(
+            run_dir / "apt-sandbox",
+            packages,
+            architecture,
+            config,
+            load_network_config(),
+        )
+        download.update_package_indexes(sandbox)
+
+        groups: dict[download.SourceSpec, list[PackageSpec]] = defaultdict(list)
+        for package in packages:
+            try:
+                groups[download.resolve_source(package, architecture, sandbox)].append(package)
+            except DownloadError as exc:
+                entries[package]["error"] = str(exc)
+
+        native_architecture = build.prepare_build_environment(architecture, sandbox)
+        artifact_paths: list[Path] = []
+        for source, requested in groups.items():
+            logger.info("Building source %s for %d requested package(s)", source.display, len(requested))
+            try:
+                artifacts = build.build_source(
+                    source,
+                    requested,
+                    run_dir,
+                    architecture,
+                    native_architecture,
+                    sandbox,
+                    config.build_options,
+                )
+                for package in requested:
+                    package_artifacts = artifacts.get(package.name, [])
+                    entries[package]["source"] = source.display
+                    entries[package]["artifacts"] = [path.name for path in package_artifacts]
+                    entries[package]["success"] = bool(package_artifacts)
+                    artifact_paths.extend(package_artifacts)
+                    if not package_artifacts:
+                        entries[package]["error"] = "requested binary package was not produced"
+            except BuildError as exc:
+                for package in requested:
+                    entries[package]["source"] = source.display
+                    entries[package]["error"] = str(exc)
+
+        unique_artifacts = list(dict.fromkeys(artifact_paths))
+        if unique_artifacts:
+            signing = sign_package.sign_packages(
+                unique_artifacts,
+                config.gpg_key_id,
+                config.gpg_private_key_secret,
+                config.gpg_passphrase_secret,
+            )
+
+        output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        copied: list[str] = []
+        for artifact in unique_artifacts:
+            destination = output_dir / artifact.name
+            shutil.copy2(artifact, destination)
+            copied.append(str(destination))
+
+        package_entries = [entries[package] for package in packages]
+        manifest: dict[str, object] = {
+            "builder_base": "debian:12.0",
+            "architecture": architecture,
+            "suite": config.source_suite,
+            "mirror": config.source_mirror,
+            "signing": signing,
+            "packages": package_entries,
+            "artifacts": copied,
+        }
+        (output_dir / "build-manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        failures = [entry for entry in package_entries if not entry["success"]]
+        if failures:
+            details = "; ".join(
+                f"{entry['name']}={entry['version']}: {entry.get('error', 'build failed')}"
+                for entry in failures
+            )
+            raise BuildError(
+                f"{len(failures)} package(s) failed; successful signed artifacts were preserved "
+                f"in {output_dir}: {details}"
+            )
+        logger.info("Built and signed %d requested package(s) into %s", len(packages), output_dir)
+        return manifest
     finally:
+        if sandbox is not None:
+            sandbox.remove_credentials()
         if not config.keep_build_artifacts:
-            _cleanup(pkg_work_dir)
-
-
-def _run_step_stub(ctx: PackageContext, step_fn, step_name: str) -> None:
-    try:
-        step_fn(ctx)
-    except NotImplementedError as e:
-        if ctx.config.skip_unimplemented_stubs:
-            logger.warning("[%s] Skipping unimplemented step '%s': %s", ctx.name, step_name, e)
-        else:
-            raise DebforgeError(
-                f"[{ctx.name}] Step '{step_name}' is not implemented. "
-                "Set skip_unimplemented_stubs: true in config to skip."
-            ) from e
-
-
-def _cleanup(work_dir: str) -> None:
-    if os.path.exists(work_dir):
-        logger.debug("Cleaning up build artifacts: %s", work_dir)
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
-def _print_summary(results: dict[str, bool]) -> None:
-    succeeded = [p for p, ok in results.items() if ok]
-    failed = [p for p, ok in results.items() if not ok]
-
-    logger.info("=== Build Summary ===")
-    logger.info("Total: %d  Success: %d  Failed: %d", len(results), len(succeeded), len(failed))
-
-    for pkg in succeeded:
-        logger.info("  OK  %s", pkg)
-    for pkg in failed:
-        logger.error("  FAIL  %s", pkg)
+            shutil.rmtree(run_dir, ignore_errors=True)

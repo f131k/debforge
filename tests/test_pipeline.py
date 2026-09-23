@@ -1,53 +1,45 @@
-import pytest
+from __future__ import annotations
 
-from debforge.exceptions import DebforgeError
-from debforge.pipeline import PackageContext, _run_step_stub, run_packages
+from pathlib import Path
 
-
-def _make_ctx(config):
-    return PackageContext(name="testpkg", work_dir="/tmp/test", config=config)
-
-
-def test_run_step_stub_skips_when_configured(base_config):
-    base_config.skip_unimplemented_stubs = True
-    ctx = _make_ctx(base_config)
-
-    def raises_not_impl(c):
-        raise NotImplementedError("not implemented")
-
-    # Should not raise
-    _run_step_stub(ctx, raises_not_impl, "test step")
+from debforge.package_list import PackageSpec
+from debforge.pipeline import rebuild_packages
+from debforge.steps.download import AptSandbox, SourceSpec
 
 
-def test_run_step_stub_raises_when_not_skipping(base_config):
-    base_config.skip_unimplemented_stubs = False
-    ctx = _make_ctx(base_config)
+def test_pipeline_uses_existing_steps_directly(base_config, tmp_path, mocker):
+    base_config.work_dir = str(tmp_path / "work")
+    base_config.output_dir = str(tmp_path / "output")
+    artifact = tmp_path / "hello_2.10-3_amd64.deb"
+    artifact.write_bytes(b"deb")
+    sandbox = AptSandbox({}, {}, tmp_path / "auth.conf")
 
-    def raises_not_impl(c):
-        raise NotImplementedError("not implemented")
+    validate = mocker.patch("debforge.pipeline.sign_package.validate_signing_secrets")
+    mocker.patch("debforge.pipeline.download.resolve_native_architecture", return_value="amd64")
+    setup = mocker.patch("debforge.pipeline.download.setup_apt_sandbox", return_value=sandbox)
+    update = mocker.patch("debforge.pipeline.download.update_package_indexes")
+    resolve = mocker.patch(
+        "debforge.pipeline.download.resolve_source", return_value=SourceSpec("hello", "2.10-3")
+    )
+    prepare = mocker.patch(
+        "debforge.pipeline.build.prepare_build_environment", return_value="amd64"
+    )
+    build = mocker.patch(
+        "debforge.pipeline.build.build_source", return_value={"hello": [artifact]}
+    )
+    sign = mocker.patch(
+        "debforge.pipeline.sign_package.sign_packages",
+        return_value={"mode": "debsigs", "signed": True, "artifacts": []},
+    )
 
-    with pytest.raises(DebforgeError, match="not implemented"):
-        _run_step_stub(ctx, raises_not_impl, "test step")
+    result = rebuild_packages([PackageSpec("hello", "2.10-3")], base_config)
 
-
-def test_run_packages_returns_false_on_failure(base_config, mocker):
-    mocker.patch("debforge.pipeline.run_single_package", side_effect=DebforgeError("boom"))
-    results = run_packages(["hello"], base_config)
-    assert results == {"hello": False}
-
-
-def test_run_packages_returns_true_on_success(base_config, mocker):
-    mocker.patch("debforge.pipeline.run_single_package", return_value=None)
-    results = run_packages(["hello"], base_config)
-    assert results == {"hello": True}
-
-
-def test_run_packages_mixed_results(base_config, mocker):
-    def side_effect(pkg, cfg):
-        if pkg == "fail-pkg":
-            raise DebforgeError("fail")
-
-    mocker.patch("debforge.pipeline.run_single_package", side_effect=side_effect)
-    results = run_packages(["hello", "fail-pkg"], base_config)
-    assert results["hello"] is True
-    assert results["fail-pkg"] is False
+    assert result["packages"][0]["success"] is True
+    assert Path(base_config.output_dir, artifact.name).is_file()
+    validate.assert_called_once()
+    setup.assert_called_once()
+    update.assert_called_once()
+    resolve.assert_called_once()
+    prepare.assert_called_once()
+    build.assert_called_once()
+    sign.assert_called_once()

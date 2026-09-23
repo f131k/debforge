@@ -1,60 +1,68 @@
-import os
-import subprocess
+from __future__ import annotations
+
+import stat
 
 import pytest
 
 from debforge.exceptions import DownloadError
-from debforge.steps.download import _find_dsc_file, fetch_source
+from debforge.network import NetworkConfig
+from debforge.package_list import PackageSpec
+from debforge.steps.download import AptSandbox, SourceSpec, resolve_source, setup_apt_sandbox
 
 
-def test_find_dsc_file_success(tmp_path):
-    dsc = tmp_path / "hello_1.0.dsc"
-    dsc.write_text("Format: 3.0\n")
-    result = _find_dsc_file(str(tmp_path))
-    assert result == str(dsc)
+def test_setup_apt_sandbox_uses_corporate_mirrors(base_config, tmp_path, mocker):
+    base_config.source_repositories = (
+        {
+            "mirror": "http://deb.debian.org/debian",
+            "signed_by": "/usr/share/keyrings/debian-archive-keyring.gpg",
+            "suites": ["bookworm"],
+            "components": ["main"],
+        },
+        {
+            "mirror": "http://security.debian.org/debian-security",
+            "signed_by": "/usr/share/keyrings/debian-archive-keyring.gpg",
+            "suites": ["bookworm-security"],
+            "components": ["main"],
+        },
+    )
+    mocker.patch("debforge.steps.download.resolve_native_architecture", return_value="amd64")
+    network = NetworkConfig(proxy_host="proxy.example", proxy_token="top-secret")
 
-
-def test_find_dsc_file_not_found(tmp_path):
-    with pytest.raises(DownloadError, match="No .dsc file"):
-        _find_dsc_file(str(tmp_path))
-
-
-def test_find_dsc_file_returns_first_when_multiple(tmp_path):
-    (tmp_path / "a_1.0.dsc").write_text("")
-    (tmp_path / "b_2.0.dsc").write_text("")
-    result = _find_dsc_file(str(tmp_path))
-    assert result.endswith(".dsc")
-
-
-def test_fetch_source_calls_apt_get(pkg_ctx, mocker):
-    mock_run = mocker.patch("debforge.steps.download.subprocess.run")
-    mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-
-    # Place a fake .dsc so _find_dsc_file succeeds
-    dsc_path = os.path.join(pkg_ctx.work_dir, "hello_1.0.dsc")
-    with open(dsc_path, "w") as f:
-        f.write("Format: 3.0\n")
-
-    fetch_source(pkg_ctx)
-
-    # Should have two calls: apt-get source and dpkg-query
-    assert mock_run.call_count == 2
-    call_args1 = mock_run.call_args_list[0][0][0]
-    assert "apt-get" in call_args1
-    assert "source" in call_args1
-    assert pkg_ctx.name in call_args1
-    assert pkg_ctx.dsc_path == dsc_path
-
-    call_args2 = mock_run.call_args_list[1][0][0]
-    assert "dpkg-query" in call_args2
-    assert pkg_ctx.name in call_args2
-
-
-def test_fetch_source_raises_on_apt_failure(pkg_ctx, mocker):
-    mock_run = mocker.patch("debforge.steps.download.subprocess.run")
-    mock_run.return_value = subprocess.CompletedProcess(
-        args=[], returncode=1, stdout="", stderr="E: Unable to find a source package"
+    sandbox = setup_apt_sandbox(
+        tmp_path,
+        [PackageSpec("hello", "2.10-3")],
+        "amd64",
+        base_config,
+        network,
     )
 
-    with pytest.raises(DownloadError, match="apt-get source failed"):
-        fetch_source(pkg_ctx)
+    sources = (tmp_path / "etc" / "sources.list").read_text()
+    assert "https://proxy.example/repo/extras/debian_mirror/debian bookworm" in sources
+    assert "https://proxy.example/repo/extras/debian_mirror/debian-security" in sources
+    assert "trusted=yes" in sources
+    assert sandbox.auth_path.read_text() == (
+        "machine proxy.example login token password top-secret\n"
+    )
+    assert stat.S_IMODE(sandbox.auth_path.stat().st_mode) == 0o600
+    assert "top-secret" not in (tmp_path / "etc" / "metadata.conf").read_text()
+
+
+def test_resolve_source_preserves_exact_source_version(mocker):
+    sandbox = AptSandbox({}, {}, sandbox_auth_path := mocker.MagicMock())
+    mocker.patch(
+        "debforge.steps.download.capture_command",
+        return_value="Package: libfoo\nVersion: 1:2.0-3\nSource: foo (1:2.0-3)\n",
+    )
+    result = resolve_source(PackageSpec("libfoo", "1:2.0-3"), "arm64", sandbox)
+    assert result == SourceSpec("foo", "1:2.0-3")
+    assert sandbox.auth_path is sandbox_auth_path
+
+
+def test_resolve_source_rejects_non_exact_version(mocker):
+    sandbox = AptSandbox({}, {}, mocker.MagicMock())
+    mocker.patch(
+        "debforge.steps.download.capture_command",
+        return_value="Package: hello\nVersion: 2.10-2\n",
+    )
+    with pytest.raises(DownloadError, match="no exact version"):
+        resolve_source(PackageSpec("hello", "2.10-3"), "amd64", sandbox)

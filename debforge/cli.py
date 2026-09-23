@@ -8,7 +8,7 @@ from .config import load_config
 from .exceptions import ConfigError, DebforgeError
 from .logging_setup import configure_logging
 from .package_list import PackageSpec, parse_inline_specs, parse_package_file
-from .rebuilder import rebuild_packages
+from .pipeline import rebuild_packages
 
 
 def main() -> None:
@@ -36,7 +36,7 @@ def main() -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="debforge",
-        description="Build Debian packages from source with signing and publishing.",
+        description="Build and sign Debian packages from source inside the current container.",
     )
     parser.add_argument("--config", "-c", metavar="FILE", help="Path to YAML config file")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -60,20 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     build_p.add_argument("--mirror", metavar="URL", help="APT source mirror used by the sandbox")
     build_p.add_argument("--suite", metavar="NAME", help="APT source suite used by the sandbox")
-    build_p.add_argument(
-        "--rebuild-image", action="store_true", help="Rebuild the Debian 12.0 builder image"
-    )
     build_p.add_argument("--dry-run", action="store_true", help="Log actions without executing")
     build_p.set_defaults(func=_cmd_build)
-
-    # publish subcommand
-    publish_p = subparsers.add_parser("publish", help="Publish pre-built .deb files (skips build steps)")
-    publish_p.add_argument(
-        "--deb-files", "-d", required=True, metavar="PATHS",
-        help="Space-separated paths to .deb files to publish",
-    )
-    _add_common_overrides(publish_p)
-    publish_p.set_defaults(func=_cmd_publish)
 
     # config subcommand
     config_p = subparsers.add_parser("config", help="Print resolved effective configuration and exit")
@@ -97,9 +85,6 @@ def _add_package_args(p: argparse.ArgumentParser) -> None:
 
 def _add_common_overrides(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gpg-key", metavar="FINGERPRINT", help="GPG key fingerprint for signing")
-    p.add_argument("--binary-signing-key", metavar="KEY", help="Binary signing key path/identifier")
-    p.add_argument("--docker-image", metavar="IMAGE", help="Docker image for build container")
-    p.add_argument("--repo-backend", choices=["aptly", "reprepro"], help="Apt repository backend")
     p.add_argument("--work-dir", metavar="DIR", help="Working directory for build artifacts")
 
 
@@ -112,9 +97,6 @@ def _parse_package_list(args: argparse.Namespace) -> list[PackageSpec]:
 def _build_overrides(args: argparse.Namespace) -> dict[str, object]:
     return {
         "gpg_key_id": getattr(args, "gpg_key", None),
-        "binary_signing_key": getattr(args, "binary_signing_key", None),
-        "docker_image": getattr(args, "docker_image", None),
-        "repo_backend": getattr(args, "repo_backend", None),
         "work_dir": getattr(args, "work_dir", None),
         "output_dir": getattr(args, "output_dir", None),
         "target_architecture": getattr(args, "architecture", None),
@@ -137,33 +119,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         )
         return
 
-    rebuild_packages(packages, config, rebuild_image=args.rebuild_image)
-
-
-def _cmd_publish(args: argparse.Namespace) -> None:
-    from .pipeline import PackageContext
-    from .steps import publish as publish_step
-
-    deb_files = args.deb_files.split()
-    config = load_config(args.config, _build_overrides(args))
-
-    import os
-    for deb_path in deb_files:
-        if not os.path.exists(deb_path):
-            raise DebforgeError(f"File not found: {deb_path!r}")
-
-    pkg_name = "manual"
-    ctx = PackageContext(
-        name=pkg_name,
-        work_dir=config.work_dir,
-        config=config,
-        deb_paths=deb_files,
-    )
-
-    try:
-        publish_step.add_to_repo(ctx)
-    except DebforgeError:
-        sys.exit(1)
+    rebuild_packages(packages, config)
 
 
 def _cmd_config(args: argparse.Namespace) -> None:

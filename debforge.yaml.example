@@ -1,71 +1,36 @@
-# debforge configuration file
-# Default location: ~/.config/debforge/config.yaml
-# All fields can be overridden via CLI flags.
+# This file is read by debforge inside the builder container.
+work_dir: "/work"
+output_dir: "/output"
 
-# Docker image used for isolated builds
-docker_image: "debforge-builder:latest"
-# Path to Dockerfile for auto-building the image when missing
-docker_dockerfile: "./docker/Dockerfile.builder"
-
-# Host scratch space and final package destination
-work_dir: "./.debforge-work"
-output_dir: "./artifacts"
-
-# Initial mode: build natively for the builder container architecture.
-# Change to arm64 for cross compilation on an x86-64 builder.
+# Use "native" for the container architecture, or "arm64" for a cross-build
+# on an x86-64 builder host.
 target_architecture: "native"
 
-# Isolated Bookworm APT sandbox. See debforge.bookworm.yaml for the complete
-# main, updates, and security repository profile.
 source_mirror: "http://deb.debian.org/debian"
 source_suite: "bookworm"
 source_components: ["main", "contrib", "non-free", "non-free-firmware"]
 source_pockets: ["", "-updates"]
+source_repositories:
+  - mirror: "http://deb.debian.org/debian"
+    signed_by: "/usr/share/keyrings/debian-archive-keyring.gpg"
+    suites: ["bookworm", "bookworm-updates"]
+    components: ["main", "contrib", "non-free", "non-free-firmware"]
+  - mirror: "http://security.debian.org/debian-security"
+    signed_by: "/usr/share/keyrings/debian-archive-keyring.gpg"
+    suites: ["bookworm-security"]
+    components: ["main", "contrib", "non-free", "non-free-firmware"]
+
 build_options: "nocheck"
 
-# Corporate access is intentionally configured only through the environment:
-# DEBSEC_PROXY_TOKEN enables it, and DEBSEC_PROXY_HOST optionally overrides
-# the default proxy.host host. Never put the token in this YAML.
+# DEBSEC_PROXY_TOKEN and optional DEBSEC_PROXY_HOST are read only from the
+# container environment. Never put the token in this file.
 
-# Mandatory signing runs in a separate container after package compilation.
+# Signing is mandatory. Mount both files read-only into /run/secrets.
 signing_mode: "debsigs"
-
-# Optional GPG key fingerprint/subkey selector. Empty selects the first
-# signing-capable key from the private-key secret.
 gpg_key_id: ""
-
-# Secret contents are never accepted in YAML or CLI. These paths must point to
-# files mounted directly under /run/secrets.
 gpg_private_key_secret: "/run/secrets/debforge-gpg-private-key"
 gpg_passphrase_secret: "/run/secrets/debforge-gpg-passphrase"
 
-# Legacy ELF-binary signing placeholder used only by the retired pipeline.
-# It is unrelated to the active debsigs package-signing stage.
-binary_signing_key: null
-
-# Local apt repository backend: "aptly" or "reprepro"
-repo_backend: "aptly"
-
-aptly:
-  repo_name: "local-builds"
-  publish_endpoint: "filesystem:debforge:"
-  snapshot_prefix: "debforge"
-
-reprepro:
-  repo_path: "/srv/apt/local"
-  codename: "bookworm"
-  allow_duplicates: false
-
-# Logging: DEBUG | INFO | WARNING | ERROR
 log_level: "INFO"
-log_file: null              # null = stderr only; path = also write to file
-
-# Keep per-package build directories after completion
+log_file: null
 keep_build_artifacts: false
-
-# Skip steps that raise NotImplementedError (security_scan, sign_binaries)
-skip_unimplemented_stubs: true
-
-# Debian mirror for apt-get source (null = use system /etc/apt/sources.list)
-debian_mirror: null
-debian_suite: "bookworm"

@@ -1,0 +1,9 @@
+.git
+.venv
+.debforge-work
+artifacts
+secrets
+__pycache__
+*.pyc
+pkg.tsv
+tests
